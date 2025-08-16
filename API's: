@@ -1,0 +1,82 @@
+// Authentication Middleware
+const authAdmin = async (req, res, next) => {
+  const token = req.header('Authorization')?.replace('Bearer ', '');
+  if (!token) return res.status(401).send('Access denied');
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const user = await AdminUser.findOne({ id: decoded.id });
+    if (!user) return res.status(401).send('Invalid token');
+    req.user = user;
+    next();
+  } catch (err) {
+    res.status(400).send('Invalid token');
+  }
+};
+
+// APIs
+// POST /auth/signup
+app.post('/auth/signup', async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) return res.status(400).send('Email and password required');
+
+  const hashed_password = await bcrypt.hash(password, 10);
+  const user = new AdminUser({
+    email,
+    hashed_password
+  });
+
+  try {
+    await user.save();
+    res.status(201).send('User created');
+  } catch (err) {
+    res.status(400).send('Email already exists');
+  }
+});
+
+// POST /auth/login
+app.post('/auth/login', async (req, res) => {
+  const { email, password } = req.body;
+  const user = await AdminUser.findOne({ email });
+  if (!user || !await bcrypt.compare(password, user.hashed_password)) {
+    return res.status(401).send('Invalid credentials');
+  }
+
+  const token = jwt.sign({ id: user.id }, process.env.JWT_SECRET, { expiresIn: '1h' });
+  res.json({ token });
+});
+
+// POST /media
+app.post('/media', authAdmin, async (req, res) => {
+  const { title, type, file_url } = req.body;
+  if (!title || !type || !file_url) return res.status(400).send('Missing required fields');
+
+  const media = new MediaAsset({ title, type, file_url });
+  try {
+    await media.save();
+    res.status(201).json({ id: media.id });
+  } catch (err) {
+    res.status(500).send('Failed to save media');
+  }
+});
+
+// GET /media/:id/stream-url
+app.get('/media/:id/stream-url', async (req, res) => {
+  const media = await MediaAsset.findOne({ id: req.params.id });
+  if (!media) return res.status(404).send('Media not found');
+
+  // Log view
+  const viewLog = new MediaViewLog({
+    media_id: req.params.id,
+    viewed_by_ip: req.ip
+  });
+  await viewLog.save();
+
+  // Generate secure URL (mocked for simplicity, assumes file_url is secure)
+  const secureUrl = `${media.file_url}?token=${jwt.sign({ mediaId: media.id }, process.env.JWT_SECRET, { expiresIn: '10m' })}`;
+  res.json({ url: secureUrl });
+});
+
+// Start Server
+app.listen(port, () => {
+  console.log(`Server running on port ${port}`);
+});
