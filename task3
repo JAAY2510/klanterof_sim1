@@ -1,0 +1,161 @@
+const express = require('express');
+const mongoose = require('mongoose');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+const { v4: uuidv4 } = require('uuid');
+const redis = require('redis');
+const rateLimit = require('express-rate-limit');
+
+const app = express();
+const port = process.env.PORT || 3000;
+
+// Redis Client
+const redisClient = redis.createClient({
+  url: process.env.REDIS_URL || 'redis://localhost:6379'
+});
+redisClient.connect().catch(console.error);
+
+// Middleware
+app.use(express.json());
+
+// Rate Limiting for POST /media/:id/view
+const viewLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // 100 requests per IP
+  message: 'Too many view requests from this IP'
+});
+
+// MongoDB Connection
+mongoose.connect(process.env.MONGO_URL || 'mongodb://localhost/media_platform', {
+  useNewUrlParser: true,
+  useUnifiedTopology: true
+});
+
+// Schemas
+const AdminUserSchema = new mongoose.Schema({
+  id: { type: String, default: uuidv4 },
+  email: { type: String, required: true, unique: true },
+  hashed_password: { type: String, required: true },
+  created_at: { type: Date, default: Date.now }
+});
+
+const MediaAssetSchema = new mongoose.Schema({
+  id: { type: String, default: uuidv4 },
+  title: { type: String, required: true },
+  type: { type: String, enum: ['video', 'audio'], required: true },
+  file_url: { type: String, required: true },
+  created_at: { type: Date, default: Date.now }
+});
+
+const MediaViewLogSchema = new mongoose.Schema({
+  media_id: { type: String, required: true },
+  viewed_by_ip: { type: String, required: true },
+  timestamp: { type: Date, default: Date.now }
+});
+
+const AdminUser = mongoose.model('AdminUser', AdminUserSchema);
+const MediaAsset = mongoose.model('MediaAsset', MediaAssetSchema);
+const MediaViewLog = mongoose.model('MediaViewLog', MediaViewLogSchema);
+
+// Authentication Middleware
+const authAdmin = async (req, res, next) => {
+  const token = req.header('Authorization')?.replace('Bearer ', '');
+  if (!token) return res.status(401).send('Access denied: No token provided');
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const user = await AdminUser.findOne({ id: decoded.id });
+    if (!user) return res.status(401).send('Access denied: Invalid user');
+    req.user = user;
+    next();
+  } catch (err) {
+    res.status(400).send('Invalid token');
+  }
+};
+
+// APIs
+app.post('/auth/signup', async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) return res.status(400).send('Email and password required');
+
+  const hashed_password = await bcrypt.hash(password, 10);
+  const user = new AdminUser({ email, hashed_password });
+  try {
+    await user.save();
+    res.status(201).send('User created');
+  } catch (err) {
+    res.status(400).send('Email already exists');
+  }
+});
+
+app.post('/auth/login', async (req, res) => {
+  const { email, password } = req.body;
+  const user = await AdminUser.findOne({ email });
+  if (!user || !await bcrypt.compare(password, user.hashed_password)) {
+    return res.status(401).send('Invalid credentials');
+  }
+  const token = jwt.sign({ id: user.id }, process.env.JWT_SECRET, { expiresIn: '1h' });
+  res.json({ token });
+});
+
+app.post('/media', authAdmin, async (req, res) => {
+  const { title, type, file_url } = req.body;
+  if (!title || !type || !file_url) return res.status(400).send('Missing required fields');
+  const media = new MediaAsset({ title, type, file_url });
+  try {
+    await media.save();
+    res.status(201).json({ id: media.id });
+  } catch (err) {
+    res.status(500).send('Failed to save media');
+  }
+});
+
+app.get('/media/:id/stream-url', async (req, res) => {
+  const media = await MediaAsset.findOne({ id: req.params.id });
+  if (!media) return res.status(404).send('Media not found');
+  const viewLog = new MediaViewLog({ media_id: req.params.id, viewed_by_ip: req.ip });
+  await viewLog.save();
+  const secureUrl = `${media.file_url}?token=${jwt.sign({ mediaId: media.id }, process.env.JWT_SECRET, { expiresIn: '10m' })}`;
+  res.json({ url: secureUrl });
+});
+
+app.post('/media/:id/view', viewLimiter, async (req, res) => {
+  const media = await MediaAsset.findOne({ id: req.params.id });
+  if (!media) return res.status(404).send('Media not found');
+  try {
+    const viewLog = new MediaViewLog({ media_id: req.params.id, viewed_by_ip: req.ip });
+    await viewLog.save();
+    res.status(201).send('View logged');
+  } catch (err) {
+    res.status(500).send('Failed to log view');
+  }
+});
+
+app.get('/media/:id/analytics', authAdmin, async (req, res) => {
+  const cacheKey = `analytics:${req.params.id}`;
+  const cached = await redisClient.get(cacheKey);
+  if (cached) return res.json(JSON.parse(cached));
+
+  const media = await MediaAsset.findOne({ id: req.params.id });
+  if (!media) return res.status(404).send('Media not found');
+
+  try {
+    const views = await MediaViewLog.find({ media_id: req.params.id });
+    const uniqueIps = new Set(views.map(view => view.viewed_by_ip)).size;
+    const viewsPerDay = views.reduce((acc, view) => {
+      const date = view.timestamp.toISOString().split('T')[0];
+      acc[date] = (acc[date] || 0) + 1;
+      return acc;
+    }, {});
+
+    const analytics = { total_views: views.length, unique_ips: uniqueIps, views_per_day: viewsPerDay };
+    await redisClient.setEx(cacheKey, 300, JSON.stringify(analytics)); // Cache for 5 minutes
+    res.json(analytics);
+  } catch (err) {
+    res.status(500).send('Failed to retrieve analytics');
+  }
+});
+
+// Start Server
+app.listen(port, () => {
+  console.log(`Server running on port ${port}`);
+});
